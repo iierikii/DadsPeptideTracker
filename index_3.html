@@ -1,0 +1,999 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Dad's Peptide Tracker</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#128137;</text></svg>" />
+  <meta name="theme-color" content="#2A5C43" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.29.8/babel.min.js"></script>
+  <style>html, body { margin: 0; padding: 0; }</style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useRef } = React;
+
+/* ─────────────────────────────────────────────────────────────
+   Dad's Peptide Tracker
+   A dosing logbook designed for readability: Atkinson Hyperlegible
+   type, pine-green identity, big touch targets, one-tap logging,
+   flexible regimen schedules, backdated entries, JSON/CSV backup.
+   ───────────────────────────────────────────────────────────── */
+
+const STORAGE_KEY = "dose-diary-v2";
+const APP_NAME = "Dad's Peptide Tracker";
+
+const SITES = [
+  "Abdomen · left",
+  "Abdomen · right",
+  "Thigh · left",
+  "Thigh · right",
+  "Upper arm · left",
+  "Upper arm · right",
+];
+
+const PEPTIDE_COLORS = ["#2E6E4E", "#8A5A2B", "#4A5A8A", "#7A4A6E", "#3E7A7A", "#946A3D"];
+const WEEKDAYS = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+
+/* ---------- storage (browser localStorage; same async API) ---------- */
+async function storageGet(key) {
+  try { const v = localStorage.getItem(key); return v ? { value: v } : null; } catch (e) { return null; }
+}
+async function storageSet(key, value) {
+  try { localStorage.setItem(key, value); } catch (e) { /* private mode or full — non-fatal */ }
+}
+
+/* ---------- dates ---------- */
+const toISO = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const todayISO = () => toISO(new Date());
+const nowTime = () => {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
+const addDays = (iso, n) => {
+  const [y, m, d] = iso.split("-").map(Number);
+  return toISO(new Date(y, m - 1, d + n));
+};
+const weekdayOf = (iso) => {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d).getDay();
+};
+const dateLabel = (iso) => {
+  if (iso === todayISO()) return "Today";
+  if (iso === addDays(todayISO(), -1)) return "Yesterday";
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" });
+};
+const shortDate = (iso) => {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+};
+const timeLabel = (t) => {
+  if (!t) return "";
+  const [h, min] = t.split(":").map(Number);
+  const ampm = h >= 12 ? "PM" : "AM";
+  const hh = h % 12 === 0 ? 12 : h % 12;
+  return `${hh}:${String(min).padStart(2, "0")} ${ampm}`;
+};
+
+/* ---------- dose math (U-100 insulin syringe) ---------- */
+function doseMath({ vialMg, waterMl, amount, unit }) {
+  const v = parseFloat(vialMg), w = parseFloat(waterMl), a = parseFloat(amount);
+  if (!v || !w || !a || unit === "IU") return null;
+  const conc = v / w;
+  const doseMg = unit === "mcg" ? a / 1000 : a;
+  const ml = doseMg / conc;
+  const units = ml * 100;
+  return {
+    conc: conc >= 1 ? conc.toFixed(2) : conc.toFixed(3),
+    ml: ml < 0.1 ? ml.toFixed(3) : ml.toFixed(2),
+    units: units < 10 ? units.toFixed(1) : Math.round(units * 10) / 10,
+  };
+}
+
+function nextSite(lastSite) {
+  const i = SITES.indexOf(lastSite);
+  return SITES[(i + 1) % SITES.length] || SITES[0];
+}
+
+/* ---------- regimen schedule ---------- */
+function isDue(pep, iso) {
+  const s = pep.schedule;
+  if (!s) return true;
+  if (s.startDate && iso < s.startDate) return false;
+  if (s.endDate && iso > s.endDate) return false;
+  if (s.freq === "days" && s.days && s.days.length > 0) return s.days.includes(weekdayOf(iso));
+  return true;
+}
+function scheduleLabel(pep) {
+  const s = pep.schedule;
+  if (!s) return "";
+  const freq = s.freq === "days" && s.days && s.days.length > 0
+    ? s.days.slice().sort().map((d) => WEEKDAYS[d]).join(" · ")
+    : "Every day";
+  const tod = s.timeOfDay === "AM" ? " · morning" : s.timeOfDay === "PM" ? " · evening" : "";
+  let range = "";
+  if (s.startDate && s.startDate > todayISO()) range = ` · starts ${shortDate(s.startDate)}`;
+  else if (s.endDate) range = ` · through ${shortDate(s.endDate)}`;
+  return freq + tod + range;
+}
+
+/* ---------- sample data (dates relative to today) ---------- */
+function buildSampleData() {
+  const iso = (daysAgo) => addDays(todayISO(), -daysAgo);
+  const peptides = [
+    { id: "pep-bpc", name: "BPC-157", vialMg: "10", waterMl: "3", typicalDose: "250", doseUnit: "mcg", color: PEPTIDE_COLORS[0],
+      schedule: { freq: "daily", days: [], timeOfDay: "AM", startDate: iso(20), endDate: iso(-22) } },
+    { id: "pep-ipa", name: "Ipamorelin", vialMg: "5", waterMl: "2.5", typicalDose: "200", doseUnit: "mcg", color: PEPTIDE_COLORS[1],
+      schedule: { freq: "daily", days: [], timeOfDay: "PM", startDate: iso(12), endDate: "" } },
+    { id: "pep-sema", name: "Semaglutide", vialMg: "3", waterMl: "1.5", typicalDose: "0.5", doseUnit: "mg", color: PEPTIDE_COLORS[2],
+      schedule: { freq: "days", days: [weekdayOf(iso(1))], timeOfDay: "AM", startDate: iso(25), endDate: "" } },
+  ];
+  const doses = [];
+  for (let i = 13; i >= 0; i--) {
+    doses.push({
+      id: "d-bpc-" + i, peptideId: "pep-bpc", date: iso(i),
+      time: i % 3 === 0 ? "07:45" : "08:10",
+      amount: "250", unit: "mcg", vialMg: "10", waterMl: "3",
+      site: SITES[(13 - i) % SITES.length],
+      notes: i === 9 ? "Slight redness at site, gone by evening" : i === 4 ? "Elbow feeling noticeably better" : "",
+    });
+  }
+  for (let i = 10; i >= 1; i--) {
+    doses.push({
+      id: "d-ipa-" + i, peptideId: "pep-ipa", date: iso(i),
+      time: "21:30",
+      amount: i > 6 ? "150" : "200", unit: "mcg", vialMg: "5", waterMl: "2.5",
+      site: SITES[(10 - i + 2) % SITES.length],
+      notes: i === 7 ? "Bumped dose from 150 to 200 per protocol" : i === 2 ? "Sleeping deeper this week" : "",
+    });
+  }
+  [22, 15, 8, 1].forEach((daysAgo, idx) => {
+    doses.push({
+      id: "d-sema-" + idx, peptideId: "pep-sema", date: iso(daysAgo),
+      time: "09:00",
+      amount: idx < 2 ? "0.25" : "0.5", unit: "mg", vialMg: "3", waterMl: "1.5",
+      site: idx % 2 === 0 ? "Abdomen · left" : "Abdomen · right",
+      notes: idx === 2 ? "Moved up to 0.5 mg — mild nausea day 1 only" : "",
+    });
+  });
+  return { peptides, doses };
+}
+
+/* ─────────── styles ─────────── */
+const css = `
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&display=swap');
+.dd-root { font-family:'Atkinson Hyperlegible',system-ui,sans-serif; background:#EEF2EC; min-height:100vh; color:#1E2A23; }
+.dd-root * { box-sizing:border-box; }
+.dd-hero { background:linear-gradient(160deg,#2A5C43 0%,#234C38 100%); color:#F3F7F1; padding:26px 20px 40px; border-radius:0 0 28px 28px; }
+.dd-hero-inner { max-width:560px; margin:0 auto; }
+.dd-shell { max-width:560px; margin:-22px auto 0; padding:0 14px 120px; }
+.dd-btn { font-family:inherit; border:none; cursor:pointer; border-radius:14px; font-size:18px; font-weight:700; padding:14px 20px; transition:transform .06s ease, background .15s ease, box-shadow .15s ease; }
+.dd-btn:active { transform:scale(.985); }
+.dd-btn-primary { background:#2A5C43; color:#fff; box-shadow:0 2px 6px rgba(42,92,67,.35); }
+.dd-btn-primary:hover { background:#234C38; }
+.dd-btn-quiet { background:#E2EAE0; color:#1E2A23; }
+.dd-btn-quiet:hover { background:#D5E0D2; }
+.dd-btn-danger { background:transparent; color:#9C3A2E; font-size:16px; padding:10px 14px; }
+.dd-input, .dd-select { font-family:inherit; font-size:18px; padding:12px 14px; border:2px solid #C6D2C4; border-radius:12px; background:#fff; color:#1E2A23; width:100%; }
+.dd-input:focus, .dd-select:focus { outline:3px solid #A8C8B5; border-color:#2A5C43; }
+.dd-label { display:block; font-size:15px; font-weight:700; color:#4A5A4F; margin:14px 0 6px; }
+.dd-card { background:#fff; border-radius:18px; padding:18px; border:1px solid #DFE7DC; box-shadow:0 1px 3px rgba(30,42,35,.06); margin-bottom:14px; }
+.dd-chip { font-family:inherit; font-size:16px; padding:10px 14px; border-radius:999px; border:2px solid #C6D2C4; background:#fff; cursor:pointer; color:#1E2A23; }
+.dd-chip.on { background:#2A5C43; border-color:#2A5C43; color:#fff; font-weight:700; }
+.dd-badge { font-weight:700; font-size:15px; padding:4px 12px; border-radius:999px; white-space:nowrap; }
+.dd-tabbar { position:fixed; bottom:12px; left:50%; transform:translateX(-50%); width:calc(100% - 24px); max-width:536px; background:#fff; border:1px solid #DFE7DC; box-shadow:0 6px 22px rgba(30,42,35,.16); border-radius:20px; display:flex; gap:4px; padding:8px; z-index:40; }
+.dd-tab { flex:1; font-family:inherit; background:none; border:none; cursor:pointer; padding:10px 4px 8px; border-radius:14px; font-size:15px; font-weight:700; color:#68766B; display:flex; flex-direction:column; align-items:center; gap:2px; }
+.dd-tab.on { color:#2A5C43; background:#E7F0E7; }
+.dd-tab svg { width:26px; height:26px; }
+@media (prefers-reduced-motion: reduce) { .dd-btn { transition:none; } }
+`;
+
+const IcSyringe = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+    <path d="M18 2l4 4M19.5 3.5L21 5M17 4l3 3M6 12l6-6 6 6-6 6-6-6zM6 12l-3 3 2 2 3-3M4 18l-2 2" />
+  </svg>
+);
+const IcBook = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+    <path d="M4 4h7v16H6a2 2 0 01-2-2V4zM20 4h-7v16h5a2 2 0 002-2V4z" />
+  </svg>
+);
+const IcVial = () => (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+    <path d="M9 3h6M10 3v5l-4 9a3 3 0 003 4h6a3 3 0 003-4l-4-9V3M8 14h8" />
+  </svg>
+);
+
+/* ═══════════════════════ APP ═══════════════════════ */
+function DadsPeptideTracker() {
+  const [peptides, setPeptides] = useState([]);
+  const [doses, setDoses] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [tab, setTab] = useState("today");
+  const [logDraft, setLogDraft] = useState(null);
+  const [pepDraft, setPepDraft] = useState(null);
+  const [filter, setFilter] = useState("all");
+  const [toast, setToast] = useState("");
+  const [today, setToday] = useState(todayISO());
+  const [viewDate, setViewDate] = useState(todayISO());
+  const [meta, setMeta] = useState({ lastExportAt: "", remindSnoozedUntil: "" });
+
+  /* roll the calendar forward if the app is left open past midnight */
+  useEffect(() => {
+    const t = setInterval(() => {
+      const now = todayISO();
+      setToday((prev) => {
+        if (prev !== now) {
+          setViewDate((vd) => (vd === prev ? now : vd));
+          return now;
+        }
+        return prev;
+      });
+    }, 30000);
+    return () => clearInterval(t);
+  }, []);
+
+  /* load — seeds sample history on first run */
+  useEffect(() => {
+    (async () => {
+      let found = false;
+      try {
+        const r = await storageGet(STORAGE_KEY);
+        if (r && r.value) {
+          const d = JSON.parse(r.value);
+          const hasData = (d.peptides || []).length > 0 || (d.doses || []).length > 0;
+          if (hasData || d.wiped) {
+            setPeptides(d.peptides || []);
+            setDoses(d.doses || []);
+            if (d.meta) setMeta({ lastExportAt: d.meta.lastExportAt || "", remindSnoozedUntil: d.meta.remindSnoozedUntil || "" });
+            found = true;
+          }
+        }
+      } catch (e) { /* fall through to seed */ }
+      if (!found) {
+        const s = buildSampleData();
+        setPeptides(s.peptides);
+        setDoses(s.doses);
+        storageSet(STORAGE_KEY, JSON.stringify(s));
+      }
+      setLoaded(true);
+    })().catch(() => setLoaded(true));
+  }, []);
+
+  const persist = (p, d, m = meta) => storageSet(STORAGE_KEY, JSON.stringify({ peptides: p, doses: d, meta: m }));
+  const updateMeta = (patch) => {
+    const m = { ...meta, ...patch };
+    setMeta(m);
+    persist(peptides, doses, m);
+  };
+  const flash = (msg) => { setToast(msg); setTimeout(() => setToast(""), 2200); };
+
+  const lastDoseFor = (pepId) =>
+    doses.filter((d) => d.peptideId === pepId).sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time))[0];
+  const takenOn = (pepId, iso) => doses.filter((d) => d.peptideId === pepId && d.date === iso);
+
+  const saveDose = (dose) => {
+    const next = dose.id ? doses.map((d) => (d.id === dose.id ? dose : d)) : [...doses, { ...dose, id: uid() }];
+    setDoses(next);
+    persist(peptides, next);
+    setLogDraft(null);
+    flash(dose.id ? "Entry updated" : "Dose logged ✓");
+  };
+  const deleteDose = (id) => {
+    const next = doses.filter((d) => d.id !== id);
+    setDoses(next);
+    persist(peptides, next);
+    flash("Entry deleted");
+  };
+  const savePeptide = (pep) => {
+    const next = pep.id
+      ? peptides.map((p) => (p.id === pep.id ? pep : p))
+      : [...peptides, { ...pep, id: uid(), color: PEPTIDE_COLORS[peptides.length % PEPTIDE_COLORS.length] }];
+    setPeptides(next);
+    persist(next, doses);
+    setPepDraft(null);
+    flash("Saved");
+  };
+  const deletePeptide = (id) => {
+    const next = peptides.filter((p) => p.id !== id);
+    const nextD = doses.filter((d) => d.peptideId !== id);
+    setPeptides(next); setDoses(nextD);
+    persist(next, nextD);
+    setPepDraft(null);
+    flash("Peptide removed");
+  };
+  const clearAll = () => {
+    setPeptides([]); setDoses([]);
+    storageSet(STORAGE_KEY, JSON.stringify({ peptides: [], doses: [], wiped: true }));
+    setTab("today");
+    flash("All data erased");
+  };
+  const loadSample = () => {
+    const s = buildSampleData();
+    setPeptides(s.peptides); setDoses(s.doses);
+    persist(s.peptides, s.doses);
+    flash("Sample data loaded");
+  };
+  const restoreBackup = (data) => {
+    setPeptides(data.peptides); setDoses(data.doses);
+    persist(data.peptides, data.doses);
+    flash(`Restored ${data.doses.length} entries ✓`);
+  };
+
+  const backdatedTime = (pep, last) => {
+    if (last && last.time) return last.time;
+    const tod = pep.schedule && pep.schedule.timeOfDay;
+    return tod === "PM" ? "20:00" : "08:00";
+  };
+  const logSameAsLast = (pep) => {
+    const last = lastDoseFor(pep.id);
+    if (!last) return;
+    saveDose({
+      peptideId: pep.id, date: viewDate,
+      time: viewDate === today ? nowTime() : backdatedTime(pep, last),
+      amount: last.amount, unit: last.unit, vialMg: last.vialMg, waterMl: last.waterMl,
+      site: nextSite(last.site), notes: "",
+    });
+  };
+  const openLog = (pep) => {
+    const last = lastDoseFor(pep.id);
+    setLogDraft({
+      peptideId: pep.id, date: viewDate,
+      time: viewDate === today ? nowTime() : backdatedTime(pep, last),
+      amount: last ? last.amount : pep.typicalDose || "",
+      unit: last ? last.unit : pep.doseUnit || "mcg",
+      vialMg: last ? last.vialMg : pep.vialMg || "",
+      waterMl: last ? last.waterMl : pep.waterMl || "",
+      site: last ? nextSite(last.site) : SITES[0],
+      notes: "",
+    });
+  };
+
+  /* ---------- exports ---------- */
+  const download = (content, filename, type) => {
+    const blob = new Blob([content], { type });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+  const exportCSV = () => {
+    const header = "Date,Time,Peptide,Dose,Unit,Vial (mg),Water (mL),Concentration (mg/mL),Syringe units,Injection site,Notes";
+    const esc = (s) => `"${String(s || "").replace(/"/g, '""')}"`;
+    const rows = [...doses]
+      .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time))
+      .map((d) => {
+        const pep = peptides.find((p) => p.id === d.peptideId);
+        const m = doseMath(d);
+        return [d.date, d.time, esc(pep ? pep.name : "?"), d.amount, d.unit, d.vialMg, d.waterMl, m ? m.conc : "", m ? m.units : "", esc(d.site), esc(d.notes)].join(",");
+      });
+    download(header + "\n" + rows.join("\n"), `peptide-history-${todayISO()}.csv`, "text/csv");
+    updateMeta({ lastExportAt: todayISO(), remindSnoozedUntil: "" });
+    flash("CSV downloaded");
+  };
+  const exportBackup = () => {
+    const payload = { app: APP_NAME, version: 1, exportedAt: new Date().toISOString(), peptides, doses };
+    download(JSON.stringify(payload, null, 2), `peptide-tracker-backup-${todayISO()}.json`, "application/json");
+    updateMeta({ lastExportAt: todayISO(), remindSnoozedUntil: "" });
+    flash("Backup downloaded");
+  };
+
+  if (!loaded) {
+    return (
+      <div className="dd-root"><style>{css}</style>
+        <div style={{ textAlign: "center", paddingTop: 90, fontSize: 18, color: "#68766B", fontFamily: "'Atkinson Hyperlegible',sans-serif" }}>
+          Opening the tracker…
+        </div>
+      </div>
+    );
+  }
+
+  const dueToday = peptides.filter((p) => isDue(p, today));
+  const loggedToday = dueToday.filter((p) => takenOn(p.id, today).length > 0).length;
+
+  /* backup reminder: enough entries + no export in 14 days + not snoozed */
+  const REMIND_AFTER_DAYS = 14;
+  const daysSinceExport = meta.lastExportAt ? Math.floor((new Date(today) - new Date(meta.lastExportAt)) / 86400000) : null;
+  const showBackupReminder =
+    doses.length >= 5 &&
+    (!meta.remindSnoozedUntil || today >= meta.remindSnoozedUntil) &&
+    (daysSinceExport === null || daysSinceExport >= REMIND_AFTER_DAYS);
+
+  return (
+    <div className="dd-root">
+      <style>{css}</style>
+
+      <div className="dd-hero">
+        <div className="dd-hero-inner">
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ width: 40, height: 40, borderRadius: 12, background: "rgba(255,255,255,.16)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+              <span style={{ width: 24, height: 24, display: "inline-flex" }}><IcSyringe /></span>
+            </div>
+            <div>
+              <h1 style={{ fontSize: 25, margin: 0, letterSpacing: "-0.01em", lineHeight: 1.15 }}>{APP_NAME}</h1>
+              <div style={{ fontSize: 16, opacity: 0.85 }}>
+                {new Date().toLocaleDateString(undefined, { weekday: "long", month: "long", day: "numeric" })}
+              </div>
+            </div>
+          </div>
+          {peptides.length > 0 && (
+            <div style={{ marginTop: 14, background: "rgba(255,255,255,.12)", borderRadius: 12, padding: "10px 14px", fontSize: 16.5 }}>
+              {dueToday.length === 0
+                ? "Nothing on the schedule today."
+                : loggedToday >= dueToday.length
+                  ? `All ${dueToday.length} scheduled dose${dueToday.length > 1 ? "s" : ""} logged today ✓`
+                  : `${loggedToday} of ${dueToday.length} scheduled dose${dueToday.length > 1 ? "s" : ""} logged today`}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="dd-shell">
+        {tab === "today" && showBackupReminder && (
+          <div className="dd-card" style={{ background: "#FBF3E6", border: "1px solid #E7CFA8" }}>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+              <span style={{ fontSize: 20 }}>🛟</span>
+              <div style={{ fontSize: 17, lineHeight: 1.45, color: "#5A4526" }}>
+                <b>Time to save a copy of your history.</b>{" "}
+                {meta.lastExportAt
+                  ? `Your last download was ${daysSinceExport} days ago.`
+                  : `You have ${doses.length} entries and no saved copy yet.`}{" "}
+                A quick download keeps your records safe if the app's data is ever wiped.
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
+              <button className="dd-btn dd-btn-primary" style={{ fontSize: 16, padding: "12px 16px", flex: "1 1 auto" }} onClick={exportCSV}>Download CSV</button>
+              <button className="dd-btn dd-btn-quiet" style={{ fontSize: 16, padding: "12px 16px", flex: "1 1 auto" }} onClick={exportBackup}>Full backup</button>
+              <button className="dd-btn" style={{ fontSize: 15, padding: "12px 14px", background: "transparent", color: "#8A5A2B", fontWeight: 700 }}
+                onClick={() => updateMeta({ remindSnoozedUntil: addDays(today, 7) })}>
+                Remind me in a week
+              </button>
+            </div>
+          </div>
+        )}
+        {tab === "today" && (
+          <DiaryView
+            peptides={peptides} lastDoseFor={lastDoseFor} takenOn={takenOn}
+            today={today} viewDate={viewDate} setViewDate={setViewDate}
+            onQuickLog={logSameAsLast} onOpenLog={openLog}
+            onAddPeptide={() => { setTab("peptides"); setPepDraft({}); }} onLoadSample={loadSample}
+          />
+        )}
+        {tab === "history" && (
+          <HistoryView
+            peptides={peptides} doses={doses} filter={filter} setFilter={setFilter}
+            onEdit={(d) => setLogDraft({ ...d })} onDelete={deleteDose} onExportCSV={exportCSV}
+          />
+        )}
+        {tab === "peptides" && (
+          <PeptidesView
+            peptides={peptides} doses={doses}
+            onEdit={(p) => setPepDraft({ ...p })} onAdd={() => setPepDraft({})}
+            onClearAll={clearAll} onExportCSV={exportCSV} onExportBackup={exportBackup} onRestore={restoreBackup}
+            lastExportAt={meta.lastExportAt}
+          />
+        )}
+      </div>
+
+      {logDraft && (
+        <LogForm draft={logDraft} setDraft={setLogDraft} peptides={peptides} onSave={saveDose} onCancel={() => setLogDraft(null)} />
+      )}
+      {pepDraft && (
+        <PeptideForm draft={pepDraft} setDraft={setPepDraft} onSave={savePeptide} onCancel={() => setPepDraft(null)} onDelete={deletePeptide} />
+      )}
+
+      {toast && (
+        <div style={{
+          position: "fixed", top: 16, left: "50%", transform: "translateX(-50%)",
+          background: "#1E2A23", color: "#fff", padding: "12px 22px", borderRadius: 999,
+          fontSize: 17, fontWeight: 700, zIndex: 60, fontFamily: "'Atkinson Hyperlegible',sans-serif",
+          boxShadow: "0 6px 18px rgba(30,42,35,.3)",
+        }}>{toast}</div>
+      )}
+
+      <nav className="dd-tabbar">
+        <button className={`dd-tab ${tab === "today" ? "on" : ""}`} onClick={() => setTab("today")}><IcSyringe />Diary</button>
+        <button className={`dd-tab ${tab === "history" ? "on" : ""}`} onClick={() => setTab("history")}><IcBook />History</button>
+        <button className={`dd-tab ${tab === "peptides" ? "on" : ""}`} onClick={() => setTab("peptides")}><IcVial />Peptides</button>
+      </nav>
+    </div>
+  );
+}
+
+/* ═══════════ DIARY ═══════════ */
+function DiaryView({ peptides, lastDoseFor, takenOn, today, viewDate, setViewDate, onQuickLog, onOpenLog, onAddPeptide, onLoadSample }) {
+  const isToday = viewDate === today;
+  const isPast = viewDate < today;
+
+  if (peptides.length === 0) {
+    return (
+      <div className="dd-card" style={{ textAlign: "center", padding: "40px 24px" }}>
+        <div style={{ fontSize: 44, marginBottom: 10 }}>💉</div>
+        <h2 style={{ fontSize: 22, margin: "0 0 8px" }}>Welcome, Dad</h2>
+        <p style={{ fontSize: 17, color: "#5A685E", margin: "0 0 20px", lineHeight: 1.5 }}>
+          Add the peptides you take. After that, logging a dose is one tap.
+        </p>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10, alignItems: "center" }}>
+          <button className="dd-btn dd-btn-primary" onClick={onAddPeptide}>Add your first peptide</button>
+          <button className="dd-btn dd-btn-quiet" style={{ fontSize: 16 }} onClick={onLoadSample}>Or load sample data to explore</button>
+        </div>
+      </div>
+    );
+  }
+
+  const due = peptides.filter((p) => isDue(p, viewDate));
+  const notDue = peptides.filter((p) => !isDue(p, viewDate));
+
+  const statusBadge = (pep, logged, offSchedule) => {
+    if (logged.length > 0)
+      return <span className="dd-badge" style={{ background: "#E7F0E7", color: "#2A5C43" }}>✓ Logged {timeLabel(logged[logged.length - 1].time)}</span>;
+    if (offSchedule)
+      return <span className="dd-badge" style={{ background: "#ECEFEA", color: "#68766B" }}>Not scheduled</span>;
+    const s = pep.schedule;
+    const when = s && s.timeOfDay === "AM" ? " · morning" : s && s.timeOfDay === "PM" ? " · evening" : "";
+    return <span className="dd-badge" style={{ background: "#F6ECDF", color: "#8A5A2B" }}>{isPast ? "Not logged" : `Due${when}`}</span>;
+  };
+
+  const renderCard = (pep, offSchedule) => {
+    const last = lastDoseFor(pep.id);
+    const logged = takenOn(pep.id, viewDate);
+    const math = last ? doseMath(last) : null;
+    return (
+      <div className="dd-card" key={pep.id} style={{ borderLeft: `6px solid ${pep.color}`, opacity: offSchedule ? 0.78 : 1 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", gap: 8, flexWrap: "wrap" }}>
+          <h2 style={{ fontSize: 22, margin: 0 }}>{pep.name}</h2>
+          {statusBadge(pep, logged, offSchedule)}
+        </div>
+        {pep.schedule && <div style={{ fontSize: 15, color: "#68766B", marginTop: 4 }}>{scheduleLabel(pep)}</div>}
+
+        {last ? (
+          <div style={{ margin: "10px 0 14px", fontSize: 17, color: "#40514A", lineHeight: 1.55 }}>
+            <div><b>Last dose:</b> {last.amount} {last.unit} · {shortDate(last.date)} · {last.site}</div>
+            <div><b>Mix:</b> {last.vialMg} mg vial + {last.waterMl} mL water{math && <> = {math.conc} mg/mL</>}</div>
+            {math && <div><b>Draw:</b> {math.units} units on a U-100 syringe ({math.ml} mL)</div>}
+            <div style={{ color: "#8A5A2B", marginTop: 4 }}><b>Next site:</b> {nextSite(last.site)}</div>
+          </div>
+        ) : (
+          <p style={{ fontSize: 17, color: "#5A685E", margin: "8px 0 14px" }}>No doses logged yet.</p>
+        )}
+
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          {last && (
+            <button className="dd-btn dd-btn-primary" style={{ flex: "1 1 auto" }} onClick={() => onQuickLog(pep)}>
+              {isToday ? "Log same as last time" : `Log for ${dateLabel(viewDate).toLowerCase()}`}
+            </button>
+          )}
+          <button className="dd-btn dd-btn-quiet" style={{ flex: "1 1 auto" }} onClick={() => onOpenLog(pep)}>
+            {last ? "Log with changes" : "Log first dose"}
+          </button>
+        </div>
+      </div>
+    );
+  };
+
+  return (
+    <div>
+      <div className="dd-card" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "10px 12px" }}>
+        <button className="dd-btn dd-btn-quiet" aria-label="Previous day" style={{ padding: "10px 18px", fontSize: 20 }} onClick={() => setViewDate(addDays(viewDate, -1))}>‹</button>
+        <div style={{ textAlign: "center", flex: 1 }}>
+          <div style={{ fontSize: 20, fontWeight: 700 }}>{dateLabel(viewDate)}</div>
+          {!isToday && (
+            <button onClick={() => setViewDate(today)}
+              style={{ background: "none", border: "none", cursor: "pointer", color: "#2A5C43", fontWeight: 700, fontSize: 15, fontFamily: "inherit", textDecoration: "underline", padding: 2 }}>
+              Back to today
+            </button>
+          )}
+        </div>
+        <button className="dd-btn dd-btn-quiet" aria-label="Next day" disabled={isToday}
+          style={{ padding: "10px 18px", fontSize: 20, opacity: isToday ? 0.35 : 1 }} onClick={() => !isToday && setViewDate(addDays(viewDate, 1))}>›</button>
+      </div>
+      {isPast && (
+        <p style={{ fontSize: 15, color: "#8A5A2B", margin: "0 4px 12px", lineHeight: 1.4 }}>
+          You're viewing a past day — anything you log here is saved to {dateLabel(viewDate).toLowerCase()}.
+        </p>
+      )}
+
+      {due.map((p) => renderCard(p, false))}
+
+      {notDue.length > 0 && (
+        <>
+          <div style={{ fontSize: 16, fontWeight: 700, color: "#68766B", margin: "18px 4px 8px" }}>
+            Not scheduled {isToday ? "today" : "on this day"}
+          </div>
+          {notDue.map((p) => renderCard(p, true))}
+        </>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════ HISTORY ═══════════ */
+function HistoryView({ peptides, doses, filter, setFilter, onEdit, onDelete, onExportCSV }) {
+  const [confirmId, setConfirmId] = useState(null);
+
+  const visible = useMemo(() => {
+    const list = filter === "all" ? doses : doses.filter((d) => d.peptideId === filter);
+    return [...list].sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time));
+  }, [doses, filter]);
+
+  const grouped = useMemo(() => {
+    const g = [];
+    visible.forEach((d) => {
+      const last = g[g.length - 1];
+      if (last && last.date === d.date) last.items.push(d);
+      else g.push({ date: d.date, items: [d] });
+    });
+    return g;
+  }, [visible]);
+
+  const weekCount = doses.filter((d) => d.date >= addDays(todayISO(), -6)).length;
+
+  if (doses.length === 0) {
+    return (
+      <div className="dd-card" style={{ textAlign: "center", padding: "40px 24px" }}>
+        <h2 style={{ fontSize: 22, margin: "0 0 8px" }}>Nothing logged yet</h2>
+        <p style={{ fontSize: 17, color: "#5A685E", margin: 0 }}>Your dose history will appear here after your first log.</p>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <div className="dd-card" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "14px 16px" }}>
+        <div style={{ fontSize: 17, color: "#40514A" }}><b>{weekCount}</b> dose{weekCount !== 1 ? "s" : ""} in the last 7 days</div>
+        <button className="dd-btn dd-btn-quiet" style={{ fontSize: 16, padding: "10px 16px" }} onClick={onExportCSV}>Download CSV</button>
+      </div>
+
+      {peptides.length > 1 && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
+          <button className={`dd-chip ${filter === "all" ? "on" : ""}`} onClick={() => setFilter("all")}>All</button>
+          {peptides.map((p) => (
+            <button key={p.id} className={`dd-chip ${filter === p.id ? "on" : ""}`} onClick={() => setFilter(p.id)}>{p.name}</button>
+          ))}
+        </div>
+      )}
+
+      {grouped.map((g) => (
+        <div key={g.date} style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 18, fontWeight: 700, margin: "16px 4px 8px", color: "#2A5C43" }}>{dateLabel(g.date)}</div>
+          {g.items.map((d) => {
+            const pep = peptides.find((p) => p.id === d.peptideId);
+            const m = doseMath(d);
+            return (
+              <div className="dd-card" key={d.id} style={{ padding: 16 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+                  <div style={{ fontSize: 19, fontWeight: 700, color: pep ? pep.color : "#1E2A23" }}>{pep ? pep.name : "Removed peptide"}</div>
+                  <div style={{ fontSize: 16, color: "#5A685E", whiteSpace: "nowrap" }}>{timeLabel(d.time)}</div>
+                </div>
+                <div style={{ fontSize: 17, margin: "6px 0", lineHeight: 1.5 }}>
+                  {d.amount} {d.unit}{m && <> · drew {m.units} units</>} · {d.site}
+                  <div style={{ color: "#5A685E", fontSize: 16 }}>{d.vialMg} mg vial + {d.waterMl} mL water{m && <> ({m.conc} mg/mL)</>}</div>
+                  {d.notes && <div style={{ marginTop: 4, fontStyle: "italic", color: "#40514A" }}>“{d.notes}”</div>}
+                </div>
+                <div style={{ display: "flex", gap: 6, marginTop: 4 }}>
+                  <button className="dd-btn dd-btn-quiet" style={{ fontSize: 15, padding: "8px 14px" }} onClick={() => onEdit(d)}>Edit</button>
+                  {confirmId === d.id ? (
+                    <>
+                      <button className="dd-btn dd-btn-danger" style={{ fontWeight: 700 }} onClick={() => { onDelete(d.id); setConfirmId(null); }}>Yes, delete</button>
+                      <button className="dd-btn dd-btn-quiet" style={{ fontSize: 15, padding: "8px 14px" }} onClick={() => setConfirmId(null)}>Keep</button>
+                    </>
+                  ) : (
+                    <button className="dd-btn dd-btn-danger" onClick={() => setConfirmId(d.id)}>Delete</button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ═══════════ PEPTIDES + BACKUP ═══════════ */
+function PeptidesView({ peptides, doses, onEdit, onAdd, onClearAll, onExportCSV, onExportBackup, onRestore, lastExportAt }) {
+  const [confirmWipe, setConfirmWipe] = useState(false);
+  const [restoreMsg, setRestoreMsg] = useState("");
+  const fileRef = useRef(null);
+
+  const handleRestoreFile = (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        if (!Array.isArray(data.peptides) || !Array.isArray(data.doses)) throw new Error("wrong shape");
+        onRestore({ peptides: data.peptides, doses: data.doses });
+        setRestoreMsg("");
+      } catch (err) {
+        setRestoreMsg("That file doesn't look like a tracker backup. Choose a backup .json downloaded from this app.");
+      }
+    };
+    reader.onerror = () => setRestoreMsg("Couldn't read that file. Try again.");
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  return (
+    <div>
+      {peptides.map((p) => {
+        const count = doses.filter((d) => d.peptideId === p.id).length;
+        return (
+          <div className="dd-card" key={p.id} style={{ borderLeft: `6px solid ${p.color}`, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+            <div>
+              <div style={{ fontSize: 20, fontWeight: 700 }}>{p.name}</div>
+              <div style={{ fontSize: 16, color: "#5A685E", marginTop: 2 }}>
+                {p.vialMg ? `${p.vialMg} mg vial · ${p.waterMl} mL water · ` : ""}{count} dose{count !== 1 ? "s" : ""} logged
+              </div>
+              {p.schedule && <div style={{ fontSize: 15, color: "#2A5C43", fontWeight: 700, marginTop: 2 }}>{scheduleLabel(p)}</div>}
+            </div>
+            <button className="dd-btn dd-btn-quiet" style={{ fontSize: 16, padding: "10px 16px" }} onClick={() => onEdit(p)}>Edit</button>
+          </div>
+        );
+      })}
+      <button className="dd-btn dd-btn-primary" style={{ width: "100%", marginTop: 4 }} onClick={onAdd}>+ Add a peptide</button>
+
+      {/* ── backup & restore ── */}
+      <div className="dd-card" style={{ marginTop: 18 }}>
+        <h3 style={{ fontSize: 19, margin: "0 0 4px" }}>Backup & restore</h3>
+        <p style={{ fontSize: 16, color: "#5A685E", margin: "0 0 12px", lineHeight: 1.45 }}>
+          Download a backup now and then. If the app's data is ever wiped, restoring the file brings everything back — peptides, schedules, and full history.
+        </p>
+        <p style={{ fontSize: 15, fontWeight: 700, color: lastExportAt ? "#2A5C43" : "#8A5A2B", margin: "0 0 12px" }}>
+          {lastExportAt ? `Last download: ${shortDate(lastExportAt)}` : "No copy downloaded yet"}
+        </p>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button className="dd-btn dd-btn-primary" style={{ flex: "1 1 auto", fontSize: 16 }} onClick={onExportBackup}>Download backup</button>
+          <button className="dd-btn dd-btn-quiet" style={{ flex: "1 1 auto", fontSize: 16 }} onClick={() => fileRef.current && fileRef.current.click()}>Restore from backup</button>
+          <button className="dd-btn dd-btn-quiet" style={{ flex: "1 1 auto", fontSize: 16 }} onClick={onExportCSV}>Download CSV (for your doctor)</button>
+        </div>
+        <input ref={fileRef} type="file" accept=".json,application/json" style={{ display: "none" }} onChange={handleRestoreFile} />
+        {restoreMsg && <p style={{ fontSize: 15, color: "#9C3A2E", margin: "10px 0 0", lineHeight: 1.4 }}>{restoreMsg}</p>}
+      </div>
+
+      {peptides.length > 0 && (
+        <div style={{ textAlign: "center", marginTop: 14 }}>
+          {confirmWipe ? (
+            <div style={{ fontSize: 16 }}>
+              Erase every peptide and all dose history?{" "}
+              <button className="dd-btn dd-btn-danger" style={{ fontWeight: 700 }} onClick={() => { onClearAll(); setConfirmWipe(false); }}>Yes, erase everything</button>
+              <button className="dd-btn dd-btn-quiet" style={{ fontSize: 15, padding: "8px 14px" }} onClick={() => setConfirmWipe(false)}>Keep</button>
+            </div>
+          ) : (
+            <button className="dd-btn dd-btn-danger" onClick={() => setConfirmWipe(true)}>Erase all data (start fresh)</button>
+          )}
+        </div>
+      )}
+      <p style={{ fontSize: 15, color: "#68766B", textAlign: "center", marginTop: 18, lineHeight: 1.5 }}>
+        This tracker is a personal record-keeping tool, not medical advice.<br />Always follow your prescriber's instructions.
+      </p>
+    </div>
+  );
+}
+
+/* ═══════════ LOG FORM ═══════════ */
+function LogForm({ draft, setDraft, peptides, onSave, onCancel }) {
+  const pep = peptides.find((p) => p.id === draft.peptideId);
+  const m = doseMath(draft);
+  const set = (k, v) => setDraft({ ...draft, [k]: v });
+  const valid = draft.amount && draft.date;
+
+  return (
+    <Sheet title={`${draft.id ? "Edit" : "Log"} — ${pep ? pep.name : ""}`} onClose={onCancel}>
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 1 }}>
+          <label className="dd-label">Date</label>
+          <input className="dd-input" type="date" value={draft.date} onChange={(e) => set("date", e.target.value)} />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label className="dd-label">Time</label>
+          <input className="dd-input" type="time" value={draft.time} onChange={(e) => set("time", e.target.value)} />
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 2 }}>
+          <label className="dd-label">Dose amount</label>
+          <input className="dd-input" type="number" inputMode="decimal" value={draft.amount} onChange={(e) => set("amount", e.target.value)} placeholder="e.g. 250" />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label className="dd-label">Unit</label>
+          <select className="dd-select" value={draft.unit} onChange={(e) => set("unit", e.target.value)}>
+            <option value="mcg">mcg</option><option value="mg">mg</option><option value="IU">IU</option>
+          </select>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 1 }}>
+          <label className="dd-label">Vial size (mg)</label>
+          <input className="dd-input" type="number" inputMode="decimal" value={draft.vialMg} onChange={(e) => set("vialMg", e.target.value)} placeholder="e.g. 10" />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label className="dd-label">Water added (mL)</label>
+          <input className="dd-input" type="number" inputMode="decimal" value={draft.waterMl} onChange={(e) => set("waterMl", e.target.value)} placeholder="e.g. 3" />
+        </div>
+      </div>
+
+      {m && (
+        <div style={{ background: "#E7F0E7", borderRadius: 12, padding: "12px 16px", marginTop: 14, fontSize: 17, lineHeight: 1.5 }}>
+          <b>{m.conc} mg/mL</b> — draw <b>{m.units} units</b> on a U-100 insulin syringe ({m.ml} mL)
+        </div>
+      )}
+
+      <label className="dd-label">Injection site</label>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        {SITES.map((s) => (
+          <button key={s} type="button" className={`dd-chip ${draft.site === s ? "on" : ""}`} onClick={() => set("site", s)}>{s}</button>
+        ))}
+      </div>
+
+      <label className="dd-label">Notes (optional)</label>
+      <input className="dd-input" value={draft.notes || ""} onChange={(e) => set("notes", e.target.value)} placeholder="How you felt, anything unusual…" />
+
+      <div style={{ display: "flex", gap: 10, marginTop: 22 }}>
+        <button className="dd-btn dd-btn-quiet" style={{ flex: 1 }} onClick={onCancel}>Cancel</button>
+        <button className="dd-btn dd-btn-primary" style={{ flex: 2, opacity: valid ? 1 : 0.5 }} disabled={!valid} onClick={() => onSave(draft)}>
+          {draft.id ? "Save changes" : "Save dose"}
+        </button>
+      </div>
+    </Sheet>
+  );
+}
+
+/* ═══════════ PEPTIDE FORM ═══════════ */
+function PeptideForm({ draft, setDraft, onSave, onCancel, onDelete }) {
+  const set = (k, v) => setDraft({ ...draft, [k]: v });
+  const [confirm, setConfirm] = useState(false);
+  const sched = draft.schedule || { freq: "daily", days: [], timeOfDay: "ANY", startDate: "", endDate: "" };
+  const setSched = (s) => setDraft({ ...draft, schedule: s });
+  const valid = draft.name && draft.name.trim();
+
+  const handleSave = () => {
+    const s = draft.schedule;
+    const meaningful = s && (s.freq === "days" || (s.timeOfDay && s.timeOfDay !== "ANY") || s.startDate || s.endDate);
+    onSave(meaningful ? draft : { ...draft, schedule: undefined });
+  };
+
+  return (
+    <Sheet title={draft.id ? `Edit ${draft.name}` : "Add a peptide"} onClose={onCancel}>
+      <label className="dd-label">Peptide name</label>
+      <input className="dd-input" value={draft.name || ""} onChange={(e) => set("name", e.target.value)} placeholder="e.g. BPC-157" />
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 1 }}>
+          <label className="dd-label">Vial size (mg)</label>
+          <input className="dd-input" type="number" inputMode="decimal" value={draft.vialMg || ""} onChange={(e) => set("vialMg", e.target.value)} placeholder="10" />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label className="dd-label">Water added (mL)</label>
+          <input className="dd-input" type="number" inputMode="decimal" value={draft.waterMl || ""} onChange={(e) => set("waterMl", e.target.value)} placeholder="3" />
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 2 }}>
+          <label className="dd-label">Typical dose</label>
+          <input className="dd-input" type="number" inputMode="decimal" value={draft.typicalDose || ""} onChange={(e) => set("typicalDose", e.target.value)} placeholder="250" />
+        </div>
+        <div style={{ flex: 1 }}>
+          <label className="dd-label">Unit</label>
+          <select className="dd-select" value={draft.doseUnit || "mcg"} onChange={(e) => set("doseUnit", e.target.value)}>
+            <option value="mcg">mcg</option><option value="mg">mg</option><option value="IU">IU</option>
+          </select>
+        </div>
+      </div>
+
+      <div style={{ borderTop: "2px solid #DCE3DC", marginTop: 18, paddingTop: 14 }}>
+        <h3 style={{ fontSize: 19, margin: "0 0 2px" }}>Regimen schedule</h3>
+        <p style={{ fontSize: 15, color: "#68766B", margin: "0 0 4px", lineHeight: 1.4 }}>
+          Optional — sets which days this shows as due on the diary.
+        </p>
+
+        <label className="dd-label">How often</label>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button type="button" className={`dd-chip ${sched.freq !== "days" ? "on" : ""}`} onClick={() => setSched({ ...sched, freq: "daily" })}>Every day</button>
+          <button type="button" className={`dd-chip ${sched.freq === "days" ? "on" : ""}`} onClick={() => setSched({ ...sched, freq: "days" })}>Specific days</button>
+        </div>
+
+        {sched.freq === "days" && (
+          <>
+            <label className="dd-label">Which days of the week</label>
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+              {WEEKDAYS.map((w, i) => {
+                const on = (sched.days || []).includes(i);
+                return (
+                  <button key={w} type="button" className={`dd-chip ${on ? "on" : ""}`} style={{ minWidth: 52, textAlign: "center" }}
+                    onClick={() => setSched({ ...sched, days: on ? sched.days.filter((d) => d !== i) : [...(sched.days || []), i] })}>
+                    {w}
+                  </button>
+                );
+              })}
+            </div>
+            <p style={{ fontSize: 14, color: "#68766B", margin: "6px 2px 0" }}>
+              e.g. tap Mo · Th for twice weekly, or Mo · Tu · Fr for a M/T/F protocol.
+            </p>
+          </>
+        )}
+
+        <label className="dd-label">Time of day</label>
+        <div style={{ display: "flex", gap: 8 }}>
+          {[["AM", "Morning"], ["PM", "Evening"], ["ANY", "Anytime"]].map(([v, lbl]) => (
+            <button key={v} type="button" className={`dd-chip ${(sched.timeOfDay || "ANY") === v ? "on" : ""}`} onClick={() => setSched({ ...sched, timeOfDay: v })}>{lbl}</button>
+          ))}
+        </div>
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ flex: 1 }}>
+            <label className="dd-label">Start date</label>
+            <input className="dd-input" type="date" value={sched.startDate || ""} onChange={(e) => setSched({ ...sched, startDate: e.target.value })} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label className="dd-label">End date (optional)</label>
+            <input className="dd-input" type="date" value={sched.endDate || ""} onChange={(e) => setSched({ ...sched, endDate: e.target.value })} />
+          </div>
+        </div>
+        {(sched.startDate || sched.endDate || sched.freq === "days" || (sched.timeOfDay && sched.timeOfDay !== "ANY")) && (
+          <button type="button" className="dd-btn dd-btn-quiet" style={{ fontSize: 15, padding: "8px 14px", marginTop: 10 }}
+            onClick={() => setSched({ freq: "daily", days: [], timeOfDay: "ANY", startDate: "", endDate: "" })}>
+            Clear schedule
+          </button>
+        )}
+      </div>
+
+      <div style={{ display: "flex", gap: 10, marginTop: 20 }}>
+        <button className="dd-btn dd-btn-quiet" style={{ flex: 1 }} onClick={onCancel}>Cancel</button>
+        <button className="dd-btn dd-btn-primary" style={{ flex: 2, opacity: valid ? 1 : 0.5 }} disabled={!valid} onClick={handleSave}>Save</button>
+      </div>
+
+      {draft.id && (
+        <div style={{ marginTop: 16, textAlign: "center" }}>
+          {confirm ? (
+            <div style={{ fontSize: 16 }}>
+              This also deletes its dose history.{" "}
+              <button className="dd-btn dd-btn-danger" style={{ fontWeight: 700 }} onClick={() => onDelete(draft.id)}>Delete anyway</button>
+              <button className="dd-btn dd-btn-quiet" style={{ fontSize: 15, padding: "8px 14px" }} onClick={() => setConfirm(false)}>Keep</button>
+            </div>
+          ) : (
+            <button className="dd-btn dd-btn-danger" onClick={() => setConfirm(true)}>Remove this peptide</button>
+          )}
+        </div>
+      )}
+    </Sheet>
+  );
+}
+
+/* ═══════════ Sheet ═══════════ */
+function Sheet({ title, children, onClose }) {
+  return (
+    <div
+      style={{ position: "fixed", inset: 0, background: "rgba(30,42,35,.45)", zIndex: 50, display: "flex", alignItems: "flex-end", justifyContent: "center" }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      <div style={{
+        background: "#F6F8F4", width: "100%", maxWidth: 560, maxHeight: "92vh", overflowY: "auto",
+        borderRadius: "22px 22px 0 0", padding: "22px 20px 34px", fontFamily: "'Atkinson Hyperlegible',sans-serif",
+        boxShadow: "0 -8px 30px rgba(30,42,35,.25)",
+      }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+          <h2 style={{ fontSize: 22, margin: 0 }}>{title}</h2>
+          <button onClick={onClose} aria-label="Close" style={{ background: "#E2EAE0", border: "none", borderRadius: 999, width: 40, height: 40, fontSize: 20, cursor: "pointer", color: "#1E2A23" }}>✕</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<DadsPeptideTracker />);
+  </script>
+</body>
+</html>
